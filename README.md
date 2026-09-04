@@ -1,10 +1,9 @@
 <div align="center">
   <h1>Telesnap</h1>
   <p>A short-lived HTTP API for installing and exercising test snaps.</p>
-  <a href="https://vibecoded.fyi/">
-    <img src="https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded.svg" alt="Proudly Vibe Coded">
-  </a>
 </div>
+
+[![AI usage: vibe](https://nsg.github.io/aibadge/vibe.svg)](https://nsg.github.io/aibadge/#vibe)
 
 ## About
 
