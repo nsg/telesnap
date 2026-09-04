@@ -1,0 +1,101 @@
+name: Build and publish latest release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: latest-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/master'
+    # Keep the glibc baseline aligned with the documented Ubuntu 24.04 target.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache Cargo data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      - name: Verify source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package release assets
+        run: |
+          install -D --mode=0755 target/release/telesnap dist/telesnap-linux-x86_64-glibc
+          install -D --mode=0755 target/release/telesnap dist/bundle/telesnap/telesnap
+          install -D --mode=0644 packaging/telesnap.service dist/bundle/telesnap/telesnap.service
+          install -D --mode=0644 packaging/telesnap.env.example dist/bundle/telesnap/telesnap.env.example
+          install -D --mode=0644 README.md dist/bundle/telesnap/README.md
+          install -D --mode=0644 LICENSE dist/bundle/telesnap/LICENSE
+          tar --create --gzip \
+            --file dist/telesnap-linux-x86_64-glibc.tar.gz \
+            --directory dist/bundle telesnap
+          rm --recursive dist/bundle
+          (
+            cd dist
+            sha256sum \
+              telesnap-linux-x86_64-glibc \
+              telesnap-linux-x86_64-glibc.tar.gz \
+              > sha256sums.txt
+          )
+
+      - name: Create rolling latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Telesnap daemon for disposable snap test hosts."
+            echo
+            echo "## Install"
+            echo
+            echo 'Download `telesnap-linux-x86_64-glibc.tar.gz`, verify it with `sha256sums.txt`,'
+            echo 'then follow the included README to install the binary and systemd unit.'
+            echo
+            echo "## Recent changes"
+            echo
+            echo '```text'
+            git log --oneline -20
+            echo '```'
+          } > dist/release-notes.md
+
+          gh release delete latest --cleanup-tag --yes 2>/dev/null || true
+          gh release create latest \
+            --target "$GITHUB_SHA" \
+            --title "Latest" \
+            --latest \
+            --notes-file dist/release-notes.md \
+            dist/telesnap-linux-x86_64-glibc \
+            dist/telesnap-linux-x86_64-glibc.tar.gz \
+            dist/sha256sums.txt

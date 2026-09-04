@@ -23,6 +23,43 @@ The supplied systemd unit runs Telesnap as root and waits for snapd to finish se
 
 ## Quick Start
 
+Every successful push to `master` publishes a rolling `latest` release for
+x86_64 Ubuntu 24.04 or newer. Download and verify the systemd-ready bundle:
+
+```bash
+curl --fail --location --remote-name \
+  https://github.com/nsg/telesnap/releases/download/latest/telesnap-linux-x86_64-glibc.tar.gz
+curl --fail --location --remote-name \
+  https://github.com/nsg/telesnap/releases/download/latest/sha256sums.txt
+sha256sum --ignore-missing --check sha256sums.txt
+tar --extract --gzip --file telesnap-linux-x86_64-glibc.tar.gz
+cd telesnap
+```
+
+Install its runtime dependencies, binary, systemd unit, and environment file:
+
+```bash
+sudo apt-get update
+sudo apt-get install --yes ca-certificates openssl snapd squashfs-tools
+
+export TELESNAP_API_TOKEN="$(openssl rand -hex 32)"
+
+sudo install --mode 0755 telesnap /usr/local/bin/telesnap
+sudo install --mode 0644 telesnap.service \
+  /etc/systemd/system/telesnap.service
+sudo install --mode 0600 /dev/null /etc/default/telesnap
+printf 'TELESNAP_API_TOKEN=%s\nTELESNAP_BIND=127.0.0.1:8080\n' \
+  "$TELESNAP_API_TOKEN" | sudo tee /etc/default/telesnap >/dev/null
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now telesnap.service
+curl --fail-with-body http://127.0.0.1:8080/health
+```
+
+Inspect service logs with `sudo journalctl --unit telesnap --follow`.
+
+### Build from source
+
 Install Rust 1.86 or newer with [rustup](https://rustup.rs/); Ubuntu 24.04's packaged Rust compiler is too old for the current dependency lockfile. Then install the native build and runtime packages:
 
 ```bash
@@ -51,8 +88,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now telesnap.service
 curl --fail-with-body http://127.0.0.1:8080/health
 ```
-
-Inspect service logs with `sudo journalctl --unit telesnap --follow`.
 
 Set reusable values for the API examples. Replace `SNAP_URL` with a direct URL that returns the snap file without redirecting:
 
@@ -207,7 +242,7 @@ The API serves plain HTTP and provides no rate limiting. Keep the bearer token s
 Install a Rust toolchain compatible with edition 2024, then run:
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 cargo build --locked
