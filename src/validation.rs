@@ -1,5 +1,3 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
 use crate::error::AppError;
 
 pub fn snap_name(value: &str) -> Result<(), AppError> {
@@ -53,47 +51,9 @@ pub fn service_name(value: &str) -> Result<(), AppError> {
     }
 }
 
-pub fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => forbidden_v4(ip),
-        IpAddr::V6(ip) => forbidden_v6(ip),
-    }
-}
-
-fn forbidden_v4(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_documentation()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || a == 0
-        || (a == 100 && (64..=127).contains(&b))
-        || (a == 192 && b == 0 && c == 0)
-        || (a == 198 && (b == 18 || b == 19))
-        || a >= 240
-}
-
-fn forbidden_v6(ip: Ipv6Addr) -> bool {
-    let segments = ip.segments();
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (segments[0] & 0xfe00) == 0xfc00
-        || (segments[0] & 0xffc0) == 0xfe80
-        || (segments[0] & 0xffc0) == 0xfec0
-        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        || (segments[..6] == [0, 0, 0, 0, 0, 0] && segments[6..] != [0, 1])
-        || ip.to_ipv4_mapped().is_some_and(forbidden_v4)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
-    use super::{config_key, is_forbidden_ip, service_name, snap_name};
+    use super::{config_key, service_name, snap_name};
 
     #[test]
     fn validates_snap_names() {
@@ -112,31 +72,5 @@ mod tests {
         assert!(config_key("ports..http").is_err());
         assert!(service_name("web-worker").is_ok());
         assert!(service_name("../unit").is_err());
-    }
-
-    #[test]
-    fn blocks_non_public_addresses() {
-        for address in [
-            Ipv4Addr::LOCALHOST,
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(169, 254, 169, 254),
-            Ipv4Addr::new(100, 64, 0, 1),
-            Ipv4Addr::new(192, 0, 2, 1),
-        ] {
-            assert!(is_forbidden_ip(IpAddr::V4(address)), "{address}");
-        }
-        assert!(!is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-        for address in [
-            Ipv6Addr::LOCALHOST,
-            "fe80::1".parse().unwrap(),
-            "fd00::1".parse().unwrap(),
-            "2001:db8::1".parse().unwrap(),
-            "::ffff:127.0.0.1".parse().unwrap(),
-        ] {
-            assert!(is_forbidden_ip(IpAddr::V6(address)), "{address}");
-        }
-        assert!(!is_forbidden_ip(IpAddr::V6(
-            "2606:4700:4700::1111".parse().unwrap()
-        )));
     }
 }

@@ -26,8 +26,14 @@ pub enum AppError {
         operation: &'static str,
         seconds: u64,
     },
-    #[error("download failed: {0}")]
-    Download(String),
+    #[error("upload failed: {0}")]
+    Upload(String),
+    #[error("upload exceeds {limit} bytes")]
+    PayloadTooLarge { limit: u64 },
+    #[error("upload timed out after {seconds} seconds")]
+    UploadTimeout { seconds: u64 },
+    #[error("two snap uploads or installations are already in progress")]
+    InstallCapacity,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -52,7 +58,10 @@ impl IntoResponse for AppError {
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_managed"),
             Self::Command { .. } => (StatusCode::BAD_GATEWAY, "snap_command_failed"),
             Self::CommandTimeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "command_timeout"),
-            Self::Download(_) => (StatusCode::BAD_GATEWAY, "download_failed"),
+            Self::Upload(_) => (StatusCode::BAD_REQUEST, "upload_failed"),
+            Self::PayloadTooLarge { .. } => (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+            Self::UploadTimeout { .. } => (StatusCode::REQUEST_TIMEOUT, "upload_timeout"),
+            Self::InstallCapacity => (StatusCode::TOO_MANY_REQUESTS, "install_capacity_exhausted"),
             Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         let response = ErrorEnvelope {

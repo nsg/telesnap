@@ -1,7 +1,7 @@
 use std::{
     ffi::OsString,
-    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::{
         Arc,
@@ -10,13 +10,12 @@ use std::{
     time::Duration,
 };
 
+use axum::body::{Body, HttpBody};
 use chrono::{TimeDelta, Utc};
-use reqwest::{Client, Url, redirect::Policy};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::lookup_host,
     process::Command,
     sync::{Mutex, Semaphore},
     time::{MissedTickBehavior, interval, timeout},
@@ -62,7 +61,7 @@ pub struct SnapManager {
     config: Arc<Config>,
     store: StateStore,
     mutation: Arc<Mutex<()>>,
-    downloads: Arc<Semaphore>,
+    uploads: Arc<Semaphore>,
     ready: Arc<AtomicBool>,
 }
 
@@ -72,7 +71,7 @@ impl SnapManager {
             config,
             store,
             mutation: Arc::new(Mutex::new(())),
-            downloads: Arc::new(Semaphore::new(2)),
+            uploads: Arc::new(Semaphore::new(2)),
             ready: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -93,7 +92,8 @@ impl SnapManager {
 
     pub async fn install(
         &self,
-        url: Url,
+        body: Body,
+        content_length: Option<u64>,
         lifetime_seconds: u64,
     ) -> Result<InstallResult, AppError> {
         if lifetime_seconds == 0 || lifetime_seconds > self.config.max_lifetime.as_secs() {
@@ -102,10 +102,19 @@ impl SnapManager {
                 self.config.max_lifetime.as_secs()
             )));
         }
+        if content_length.is_some_and(|length| length > self.config.max_upload_bytes) {
+            return Err(AppError::PayloadTooLarge {
+                limit: self.config.max_upload_bytes,
+            });
+        }
+        let _upload_permit = self
+            .uploads
+            .try_acquire()
+            .map_err(|_| AppError::InstallCapacity)?;
 
-        let downloaded = self.download(url).await?;
-        self.validate_snap_magic(downloaded.path()).await?;
-        let metadata = self.read_snap_metadata(downloaded.path()).await?;
+        let uploaded = self.receive_upload(body).await?;
+        self.validate_snap_magic(uploaded.path()).await?;
+        let metadata = self.read_snap_metadata(uploaded.path()).await?;
         if metadata.confinement.as_deref() != Some("strict") {
             return Err(AppError::BadRequest(
                 "only snaps with strict confinement are accepted".to_owned(),
@@ -156,7 +165,7 @@ impl SnapManager {
                     "install".into(),
                     "--dangerous".into(),
                     "--no-wait".into(),
-                    downloaded.path().as_os_str().to_owned(),
+                    uploaded.path().as_os_str().to_owned(),
                 ],
                 "start snap install",
             )
@@ -583,14 +592,14 @@ impl SnapManager {
     async fn validate_snap_magic(&self, path: &Path) -> Result<(), AppError> {
         let mut file = tokio::fs::File::open(path)
             .await
-            .map_err(|error| AppError::Internal(format!("cannot open download: {error}")))?;
+            .map_err(|error| AppError::Internal(format!("cannot open upload: {error}")))?;
         let mut magic = [0_u8; 4];
         file.read_exact(&mut magic)
             .await
-            .map_err(|_| AppError::BadRequest("download is not a SquashFS snap".to_owned()))?;
+            .map_err(|_| AppError::BadRequest("upload is not a SquashFS snap".to_owned()))?;
         if &magic != b"hsqs" {
             return Err(AppError::BadRequest(
-                "download is not a SquashFS snap".to_owned(),
+                "upload is not a SquashFS snap".to_owned(),
             ));
         }
         Ok(())
@@ -626,129 +635,47 @@ impl SnapManager {
         })
     }
 
-    async fn download(&self, url: Url) -> Result<DownloadedFile, AppError> {
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(AppError::BadRequest(
-                "url must use http or https".to_owned(),
-            ));
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(AppError::BadRequest(
-                "url credentials are not allowed".to_owned(),
-            ));
-        }
-        if url.fragment().is_some() {
-            return Err(AppError::BadRequest(
-                "url fragments are not allowed".to_owned(),
-            ));
-        }
-        let _permit = self
-            .downloads
-            .acquire()
-            .await
-            .map_err(|_| AppError::Internal("download queue is unavailable".to_owned()))?;
-
-        let (client, resolved) = self.download_client(&url).await?;
-        info!(host = %url.host_str().unwrap_or(""), addresses = ?resolved, "downloading snap");
-        let mut response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| AppError::Download(error.to_string()))?;
-        if !response.status().is_success() {
-            return Err(AppError::Download(format!(
-                "remote server returned {} (redirects are not followed)",
-                response.status()
-            )));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > self.config.max_download_bytes)
-        {
-            return Err(AppError::BadRequest(format!(
-                "download exceeds {} bytes",
-                self.config.max_download_bytes
-            )));
-        }
-
+    async fn receive_upload(&self, mut body: Body) -> Result<UploadedFile, AppError> {
         let path = self
             .config
-            .download_dir
+            .upload_dir
             .join(format!("{}.snap", Uuid::new_v4()));
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .await
-            .map_err(|error| AppError::Internal(format!("cannot create download: {error}")))?;
-        let downloaded = DownloadedFile(path);
-        let mut received = 0_u64;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| AppError::Download(error.to_string()))?
-        {
-            received = received
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| AppError::BadRequest("download is too large".to_owned()))?;
-            if received > self.config.max_download_bytes {
-                return Err(AppError::BadRequest(format!(
-                    "download exceeds {} bytes",
-                    self.config.max_download_bytes
-                )));
+            .map_err(|error| AppError::Internal(format!("cannot create upload: {error}")))?;
+        let uploaded = UploadedFile(path);
+        let receive = async move {
+            let mut received = 0_u64;
+            while let Some(frame) =
+                std::future::poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await
+            {
+                let frame = frame.map_err(|error| AppError::Upload(error.to_string()))?;
+                let Ok(chunk) = frame.into_data() else {
+                    continue;
+                };
+                received =
+                    checked_upload_size(received, chunk.len(), self.config.max_upload_bytes)?;
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| AppError::Internal(format!("cannot write upload: {error}")))?;
             }
-            file.write_all(&chunk)
+            if received == 0 {
+                return Err(AppError::BadRequest("upload body is empty".to_owned()));
+            }
+            file.flush()
                 .await
-                .map_err(|error| AppError::Internal(format!("cannot write download: {error}")))?;
-        }
-        file.flush()
-            .await
-            .map_err(|error| AppError::Internal(format!("cannot flush download: {error}")))?;
-        Ok(downloaded)
-    }
-
-    async fn download_client(&self, url: &Url) -> Result<(Client, Vec<SocketAddr>), AppError> {
-        let host = url
-            .host_str()
-            .ok_or_else(|| AppError::BadRequest("url must contain a host".to_owned()))?;
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| AppError::BadRequest("url has no usable port".to_owned()))?;
-        let addresses: Vec<_> = if let Ok(ip) = host.parse::<IpAddr>() {
-            vec![SocketAddr::new(ip, port)]
-        } else {
-            lookup_host((host, port))
-                .await
-                .map_err(|error| AppError::Download(format!("cannot resolve host: {error}")))?
-                .collect()
+                .map_err(|error| AppError::Internal(format!("cannot flush upload: {error}")))?;
+            info!(bytes = received, "received snap upload");
+            Ok(uploaded)
         };
-        if addresses.is_empty() {
-            return Err(AppError::Download(
-                "host resolved to no addresses".to_owned(),
-            ));
-        }
-        if !self.config.allow_private_urls
-            && addresses
-                .iter()
-                .any(|address| validation::is_forbidden_ip(address.ip()))
-        {
-            return Err(AppError::BadRequest(
-                "url resolves to a non-public address".to_owned(),
-            ));
-        }
-
-        let mut builder = Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .connect_timeout(std::time::Duration::from_secs(15))
-            .timeout(self.config.download_timeout);
-        if host.parse::<IpAddr>().is_err() {
-            builder = builder.resolve_to_addrs(host, &addresses);
-        }
-        let client = builder
-            .build()
-            .map_err(|error| AppError::Internal(format!("cannot build HTTP client: {error}")))?;
-        Ok((client, addresses))
+        timeout(self.config.upload_timeout, receive)
+            .await
+            .map_err(|_| AppError::UploadTimeout {
+                seconds: self.config.upload_timeout.as_secs(),
+            })?
     }
 
     async fn run_command(
@@ -969,7 +896,18 @@ fn parse_active_change_ids(output: &[u8]) -> Result<Vec<String>, AppError> {
         .map(|ids| ids.into_iter().flatten().collect())
 }
 
-struct DownloadedFile(PathBuf);
+fn checked_upload_size(received: u64, chunk_size: usize, limit: u64) -> Result<u64, AppError> {
+    let total = received
+        .checked_add(chunk_size as u64)
+        .ok_or(AppError::PayloadTooLarge { limit })?;
+    if total > limit {
+        Err(AppError::PayloadTooLarge { limit })
+    } else {
+        Ok(total)
+    }
+}
+
+struct UploadedFile(PathBuf);
 
 struct SnapMetadata {
     name: String,
@@ -977,18 +915,18 @@ struct SnapMetadata {
     snap_type: Option<String>,
 }
 
-impl DownloadedFile {
+impl UploadedFile {
     fn path(&self) -> &Path {
         &self.0
     }
 }
 
-impl Drop for DownloadedFile {
+impl Drop for UploadedFile {
     fn drop(&mut self) {
         if let Err(error) = std::fs::remove_file(&self.0)
             && error.kind() != std::io::ErrorKind::NotFound
         {
-            warn!(path = %self.0.display(), %error, "failed to delete downloaded snap");
+            warn!(path = %self.0.display(), %error, "failed to delete uploaded snap");
         }
     }
 }
@@ -1066,16 +1004,42 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
+    use axum::body::Body;
     use chrono::{TimeDelta, Utc};
+    use tempfile::{TempDir, tempdir};
 
-    use crate::state::{Expiration, LifecycleStatus};
+    use crate::{
+        config::Config,
+        error::AppError,
+        state::{Expiration, LifecycleStatus, StateStore},
+    };
 
     use super::{
-        parse_active_change_ids, parse_change_id, pending_is_stale, pending_lifetime_seconds,
-        promoted_record, service_target, top_level_yaml_scalar, unquote_yaml_scalar,
+        SnapManager, checked_upload_size, parse_active_change_ids, parse_change_id,
+        pending_is_stale, pending_lifetime_seconds, promoted_record, service_target,
+        top_level_yaml_scalar, unquote_yaml_scalar,
     };
+
+    async fn test_manager(max_upload_bytes: u64) -> (SnapManager, TempDir) {
+        let directory = tempdir().unwrap();
+        let upload_dir = directory.path().join("uploads");
+        tokio::fs::create_dir(&upload_dir).await.unwrap();
+        let config = Arc::new(Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            api_token: "test-token-that-is-at-least-32-bytes".to_owned(),
+            state_path: directory.path().join("state.json"),
+            upload_dir,
+            max_upload_bytes,
+            max_lifetime: Duration::from_secs(86_400),
+            command_timeout: Duration::from_secs(300),
+            pending_timeout: Duration::from_secs(600),
+            upload_timeout: Duration::from_secs(60),
+        });
+        let store = StateStore::load(config.state_path.clone()).await.unwrap();
+        (SnapManager::new(config, store), directory)
+    }
 
     #[test]
     fn builds_service_targets_without_shell_syntax() {
@@ -1173,5 +1137,75 @@ mod tests {
         };
 
         assert_eq!(pending_lifetime_seconds(&record).unwrap(), 900);
+    }
+
+    #[test]
+    fn upload_limit_accepts_files_larger_than_one_gibibyte() {
+        let one_gibibyte = 1024_u64 * 1024 * 1024;
+        let limit = 2 * one_gibibyte;
+        assert_eq!(
+            checked_upload_size(1, one_gibibyte as usize, limit).unwrap(),
+            one_gibibyte + 1
+        );
+        assert!(checked_upload_size(limit, 1, limit).is_err());
+    }
+
+    #[tokio::test]
+    async fn streams_uploads_to_temporary_files_and_removes_them_on_drop() {
+        let (manager, _directory) = test_manager(1024).await;
+        let bytes = b"hsqs-test-snap";
+        let uploaded = manager
+            .receive_upload(Body::from(bytes.as_slice()))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(uploaded.path()).await.unwrap(), bytes);
+        let path = uploaded.path().to_owned();
+        drop(uploaded);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn removes_partial_files_when_streamed_limit_is_exceeded() {
+        let (manager, _directory) = test_manager(4).await;
+        let error = match manager.receive_upload(Body::from("12345")).await {
+            Ok(_) => panic!("oversized upload was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, AppError::PayloadTooLarge { limit: 4 }));
+        assert_eq!(
+            std::fs::read_dir(&manager.config.upload_dir)
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_third_concurrent_install_before_reading_its_body() {
+        let (manager, _directory) = test_manager(1024).await;
+        let _first = manager.uploads.try_acquire().unwrap();
+        let _second = manager.uploads.try_acquire().unwrap();
+        let error = manager
+            .install(Body::from("not-read"), None, 60)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::InstallCapacity));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_oversized_content_length_before_reading_the_body() {
+        let (manager, _directory) = test_manager(4).await;
+        let error = manager
+            .install(Body::from("not-read"), Some(5), 60)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::PayloadTooLarge { limit: 4 }));
+        assert_eq!(
+            std::fs::read_dir(&manager.config.upload_dir)
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

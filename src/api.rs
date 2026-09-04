@@ -2,17 +2,23 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    body::Body,
+    extract::{Path, Query, Request, State, rejection::QueryRejection},
+    http::{
+        HeaderMap, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+    },
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{error::AppError, snap::SnapManager};
+
+const AGENT_DOCS: &str = include_str!("../docs.md");
+const LANDING_PAGE: &str = include_str!("../landing.html");
 
 #[derive(Clone)]
 struct AppState {
@@ -26,8 +32,7 @@ struct Health {
 }
 
 #[derive(Deserialize)]
-struct InstallRequest {
-    url: String,
+struct InstallQuery {
     lifetime_seconds: u64,
 }
 
@@ -69,9 +74,19 @@ pub fn router(manager: Arc<SnapManager>, token: String) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
 
     Router::new()
+        .route("/", get(landing))
         .route("/health", get(health))
+        .route("/docs.md", get(docs))
         .merge(protected)
         .with_state(state)
+}
+
+async fn landing() -> Html<&'static str> {
+    Html(LANDING_PAGE)
+}
+
+async fn docs() -> impl IntoResponse {
+    ([(CONTENT_TYPE, "text/markdown; charset=utf-8")], AGENT_DOCS)
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -114,12 +129,31 @@ async fn list_managed(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn install(
     State(state): State<AppState>,
-    Json(request): Json<InstallRequest>,
+    query: Result<Query<InstallQuery>, QueryRejection>,
+    request: Request,
 ) -> Result<impl IntoResponse, AppError> {
-    let url = Url::parse(&request.url)
-        .map_err(|error| AppError::BadRequest(format!("invalid url: {error}")))?;
-    let result = state.manager.install(url, request.lifetime_seconds).await?;
+    let Query(query) =
+        query.map_err(|error| AppError::BadRequest(format!("invalid install query: {error}")))?;
+    let content_length = parse_content_length(request.headers())?;
+    let body: Body = request.into_body();
+    let result = state
+        .manager
+        .install(body, content_length, query.lifetime_seconds)
+        .await?;
     Ok((StatusCode::CREATED, Json(result)))
+}
+
+fn parse_content_length(headers: &HeaderMap) -> Result<Option<u64>, AppError> {
+    headers
+        .get(CONTENT_LENGTH)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| AppError::BadRequest("invalid Content-Length header".to_owned()))?
+                .parse::<u64>()
+                .map_err(|_| AppError::BadRequest("invalid Content-Length header".to_owned()))
+        })
+        .transpose()
 }
 
 async fn remove(
@@ -239,9 +273,19 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use axum::{http::StatusCode, response::IntoResponse};
+    use axum::{
+        body::to_bytes,
+        http::{
+            HeaderMap, HeaderValue, StatusCode,
+            header::{CONTENT_LENGTH, CONTENT_TYPE},
+        },
+        response::IntoResponse,
+    };
 
-    use super::{constant_time_equal, health_response};
+    use super::{
+        AGENT_DOCS, LANDING_PAGE, constant_time_equal, docs, health_response, landing,
+        parse_content_length,
+    };
 
     #[test]
     fn compares_tokens() {
@@ -260,5 +304,32 @@ mod tests {
             health_response(false).into_response().status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn parses_optional_content_length() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(parse_content_length(&headers).unwrap(), None);
+
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("1073741824"));
+        assert_eq!(parse_content_length(&headers).unwrap(), Some(1_073_741_824));
+
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("not-a-number"));
+        assert!(parse_content_length(&headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn serves_public_discovery_pages_with_correct_types() {
+        let landing = landing().await.into_response();
+        assert_eq!(landing.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+        let landing_body = to_bytes(landing.into_body(), LANDING_PAGE.len())
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&landing_body).contains("href=\"/docs.md\""));
+
+        let docs = docs().await.into_response();
+        assert_eq!(docs.headers()[CONTENT_TYPE], "text/markdown; charset=utf-8");
+        let docs_body = to_bytes(docs.into_body(), AGENT_DOCS.len()).await.unwrap();
+        assert!(String::from_utf8_lossy(&docs_body).contains("--data-binary"));
     }
 }

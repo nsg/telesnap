@@ -5,13 +5,12 @@ pub struct Config {
     pub bind: SocketAddr,
     pub api_token: String,
     pub state_path: PathBuf,
-    pub download_dir: PathBuf,
-    pub max_download_bytes: u64,
+    pub upload_dir: PathBuf,
+    pub max_upload_bytes: u64,
     pub max_lifetime: Duration,
     pub command_timeout: Duration,
     pub pending_timeout: Duration,
-    pub download_timeout: Duration,
-    pub allow_private_urls: bool,
+    pub upload_timeout: Duration,
 }
 
 impl Config {
@@ -43,12 +42,12 @@ impl Config {
             state_path: env::var_os("TELESNAP_STATE_PATH")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| "/var/lib/telesnap/expirations.json".into()),
-            download_dir: env::var_os("TELESNAP_DOWNLOAD_DIR")
+            upload_dir: env::var_os("TELESNAP_UPLOAD_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| "/var/lib/telesnap/downloads".into()),
-            max_download_bytes: parse_positive_env(
-                "TELESNAP_MAX_DOWNLOAD_BYTES",
-                512 * 1024 * 1024,
+                .unwrap_or_else(|| "/var/lib/telesnap/uploads".into()),
+            max_upload_bytes: parse_positive_env(
+                "TELESNAP_MAX_UPLOAD_BYTES",
+                2 * 1024 * 1024 * 1024,
             )?,
             max_lifetime: Duration::from_secs(parse_positive_env(
                 "TELESNAP_MAX_LIFETIME_SECONDS",
@@ -56,11 +55,10 @@ impl Config {
             )?),
             command_timeout: Duration::from_secs(command_timeout_seconds),
             pending_timeout: Duration::from_secs(pending_timeout_seconds),
-            download_timeout: Duration::from_secs(parse_positive_env(
-                "TELESNAP_DOWNLOAD_TIMEOUT_SECONDS",
-                300,
+            upload_timeout: Duration::from_secs(parse_positive_env(
+                "TELESNAP_UPLOAD_TIMEOUT_SECONDS",
+                3_600,
             )?),
-            allow_private_urls: parse_env("TELESNAP_ALLOW_PRIVATE_URLS", "false")?,
         })
     }
 
@@ -72,17 +70,17 @@ impl Config {
                 fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
             }
         }
-        let created = !self.download_dir.exists();
-        fs::create_dir_all(&self.download_dir)?;
+        let created = !self.upload_dir.exists();
+        fs::create_dir_all(&self.upload_dir)?;
         if created {
-            fs::set_permissions(&self.download_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&self.upload_dir, fs::Permissions::from_mode(0o700))?;
         }
-        self.remove_stale_downloads()?;
+        self.remove_stale_uploads()?;
         Ok(())
     }
 
-    fn remove_stale_downloads(&self) -> Result<(), std::io::Error> {
-        for entry in fs::read_dir(&self.download_dir)? {
+    fn remove_stale_uploads(&self) -> Result<(), std::io::Error> {
+        for entry in fs::read_dir(&self.upload_dir)? {
             let entry = entry?;
             let path = entry.path();
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -141,12 +139,48 @@ fn parse_positive_env(name: &str, default: u64) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_root;
+    use std::{fs, time::Duration};
+
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    use super::{Config, ensure_root};
 
     #[test]
     fn root_check_reads_the_effective_uid_on_linux() {
         if let Err(error) = ensure_root() {
             assert_eq!(error, "telesnap must run as root");
         }
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_telesnap_uploads() {
+        let directory = tempdir().unwrap();
+        let upload_dir = directory.path().join("uploads");
+        fs::create_dir(&upload_dir).unwrap();
+        let stale_upload = upload_dir.join(format!("{}.snap", Uuid::new_v4()));
+        let unrelated_snap = upload_dir.join("keep-me.snap");
+        let unrelated_file = upload_dir.join(Uuid::new_v4().to_string());
+        fs::write(&stale_upload, b"stale").unwrap();
+        fs::write(&unrelated_snap, b"unrelated").unwrap();
+        fs::write(&unrelated_file, b"unrelated").unwrap();
+
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            api_token: "test-token-that-is-at-least-32-bytes".to_owned(),
+            state_path: directory.path().join("state.json"),
+            upload_dir,
+            max_upload_bytes: 1024,
+            max_lifetime: Duration::from_secs(60),
+            command_timeout: Duration::from_secs(60),
+            pending_timeout: Duration::from_secs(120),
+            upload_timeout: Duration::from_secs(60),
+        };
+
+        config.remove_stale_uploads().unwrap();
+
+        assert!(!stale_upload.exists());
+        assert!(unrelated_snap.exists());
+        assert!(unrelated_file.exists());
     }
 }

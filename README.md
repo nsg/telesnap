@@ -1,17 +1,20 @@
 <div align="center">
   <h1>Telesnap</h1>
   <p>A short-lived HTTP API for installing and exercising test snaps.</p>
+  <a href="https://vibecoded.fyi/">
+    <img src="https://vibecoded.fyi/badges/flat/main/proudly-vibe-coded.svg" alt="Proudly Vibe Coded">
+  </a>
 </div>
 
 ## About
 
-Telesnap wraps the Ubuntu `snap` command for disposable snap testing. It downloads an unsigned `.snap` from an HTTP(S) URL, verifies that it is a SquashFS snap with strict confinement, installs it with `snap install --dangerous`, and purges it after a required lifetime.
+Telesnap wraps the Ubuntu `snap` command for disposable snap testing. It accepts an uploaded unsigned `.snap`, streams it directly to disk, verifies that it is a SquashFS snap with strict confinement, installs it with `snap install --dangerous`, and purges it after a required lifetime.
 
 The supplied systemd unit runs Telesnap as root and waits for snapd to finish seeding before the API starts. Telesnap can read and change snap configuration, read snap service logs, control services, and remove or purge only the snaps recorded in its own state file.
 
 ## Features
 
-- Install unsigned, strict-confinement snaps from HTTP(S) URLs.
+- Stream unsigned, strict-confinement snap uploads directly to disk.
 - Require a lifetime for every install and retry automatic purge after expiry.
 - Reconcile interrupted installs and externally removed snaps at startup.
 - List the snaps managed by Telesnap with pending/installed state and expiry times.
@@ -89,11 +92,11 @@ sudo systemctl enable --now telesnap.service
 curl --fail-with-body http://127.0.0.1:8080/health
 ```
 
-Set reusable values for the API examples. Replace `SNAP_URL` with a direct URL that returns the snap file without redirecting:
+Set reusable values for the API examples. `SNAP_FILE` is the local snap package to upload:
 
 ```bash
 export BASE_URL="http://127.0.0.1:8080"
-export SNAP_URL="https://downloads.example.com/hello-world.snap"
+export SNAP_FILE="./hello-world.snap"
 export SNAP_NAME="hello-world"
 export AUTH_HEADER="Authorization: Bearer $TELESNAP_API_TOKEN"
 ```
@@ -105,26 +108,27 @@ export AUTH_HEADER="Authorization: Bearer $TELESNAP_API_TOKEN"
 | `TELESNAP_API_TOKEN` | Yes | None | Bearer token; must contain at least 32 visible ASCII bytes. |
 | `TELESNAP_BIND` | No | `127.0.0.1:8080` | Listen address. |
 | `TELESNAP_STATE_PATH` | No | `/var/lib/telesnap/expirations.json` | Persistent managed-snap and expiry state. |
-| `TELESNAP_DOWNLOAD_DIR` | No | `/var/lib/telesnap/downloads` | Directory for temporary snap downloads. |
-| `TELESNAP_MAX_DOWNLOAD_BYTES` | No | `536870912` | Maximum downloaded snap size in bytes. |
+| `TELESNAP_UPLOAD_DIR` | No | `/var/lib/telesnap/uploads` | Directory for temporary snap uploads. |
+| `TELESNAP_MAX_UPLOAD_BYTES` | No | `2147483648` | Maximum uploaded snap size in bytes (2 GiB). |
 | `TELESNAP_MAX_LIFETIME_SECONDS` | No | `86400` | Maximum accepted install lifetime. |
 | `TELESNAP_COMMAND_TIMEOUT_SECONDS` | No | `300` | Timeout for each `snap` or `unsquashfs` command. |
 | `TELESNAP_PENDING_TIMEOUT_SECONDS` | No | Command timeout + 300 | Maximum time before an unfinished install change is aborted. |
-| `TELESNAP_DOWNLOAD_TIMEOUT_SECONDS` | No | `300` | Timeout for the complete HTTP(S) download. |
-| `TELESNAP_ALLOW_PRIVATE_URLS` | No | `false` | Permit download hosts that resolve to private or otherwise non-public IP addresses. |
+| `TELESNAP_UPLOAD_TIMEOUT_SECONDS` | No | `3600` | Timeout for receiving the complete request body. |
 | `RUST_LOG` | No | `telesnap=info` | Tracing filter for daemon logs. |
 
 Numeric limits and timeouts must be greater than zero. The pending timeout must be at least as long as the command timeout. See [`packaging/telesnap.env.example`](packaging/telesnap.env.example) for an environment-file template and [`packaging/telesnap.service`](packaging/telesnap.service) for the systemd unit.
 
 ## API
 
-`GET /health` is unauthenticated. Every `/v1` request requires `Authorization: Bearer <token>`.
+`GET /`, `GET /health`, and `GET /docs.md` are unauthenticated. Every `/v1` request requires `Authorization: Bearer <token>`. `/docs.md` is an agent-oriented guide embedded in the service binary.
 
 | Method | Path | Success | Purpose |
 | --- | --- | --- | --- |
+| `GET` | `/` | `200` | Show the human-oriented landing page. |
 | `GET` | `/health` | `200`, `503` | Report whether snapd is seeded and reachable. |
+| `GET` | `/docs.md` | `200` | Return the Markdown agent guide. |
 | `GET` | `/v1/snaps` | `200` | List managed snaps and their timestamps. |
-| `POST` | `/v1/snaps/install` | `201` | Download and install a snap for a required lifetime. |
+| `POST` | `/v1/snaps/install?lifetime_seconds={seconds}` | `201` | Upload and install a snap for a required lifetime. |
 | `DELETE` | `/v1/snaps/{snap}` | `204` | Run `snap remove` and remove its Telesnap state. |
 | `DELETE` | `/v1/snaps/{snap}/purge` | `204` | Run `snap remove --purge` and remove its Telesnap state. |
 | `GET` | `/v1/snaps/{snap}/config` | `200` | Read all configuration as JSON. |
@@ -136,14 +140,15 @@ Numeric limits and timeouts must be greater than zero. The pending timeout must 
 | `POST` | `/v1/snaps/{snap}/services/stop` | `200` | Stop snap services. |
 | `POST` | `/v1/snaps/{snap}/services/restart` | `200` | Restart snap services. |
 
-Install a snap for 15 minutes:
+Upload a snap for 15 minutes. The request body is streamed to disk, so files up to the configured 2 GiB default limit are not buffered in memory:
 
 ```bash
 curl --fail-with-body \
   --request POST \
   --header "$AUTH_HEADER" \
-  --json "{\"url\":\"$SNAP_URL\",\"lifetime_seconds\":900}" \
-  "$BASE_URL/v1/snaps/install"
+  --header "Content-Type: application/octet-stream" \
+  --data-binary "@$SNAP_FILE" \
+  "$BASE_URL/v1/snaps/install?lifetime_seconds=900"
 ```
 
 The response contains `name`, `installed_at`, and `expires_at`. The lifetime must be from 1 through `TELESNAP_MAX_LIFETIME_SECONDS` and begins only after snapd confirms the installation. Expiry and interrupted snapd changes are reconciled about every five seconds.
@@ -231,9 +236,9 @@ Run only one of those removal commands for a given installation. Errors use this
 
 Telesnap installs and controls untrusted packages through a root service. Use it only on a disposable, isolated test host or virtual machine. Do not install it on a production or personal system.
 
-Downloaded snap files are installed with `--dangerous`, without signature-assertion verification, and only application snaps declaring `confinement: strict` are accepted. System, base, gadget, kernel, and snapd packages are rejected, as are reserved system snap names. This reduces exposure but does not make arbitrary snaps trustworthy. Telesnap also refuses to operate on snaps that are not present in its managed state.
+Uploaded snap files are installed with `--dangerous`, without signature-assertion verification, and only application snaps declaring `confinement: strict` are accepted. System, base, gadget, kernel, and snapd packages are rejected, as are reserved system snap names. This reduces exposure but does not make arbitrary snaps trustworthy. Telesnap also refuses to operate on snaps that are not present in its managed state.
 
-Download URLs must use HTTP or HTTPS, may not contain credentials or fragments, and are never followed through redirects. By default, every resolved address must be public; setting `TELESNAP_ALLOW_PRIVATE_URLS=true` disables that SSRF protection. Downloads have configurable size and time limits and temporary files are removed after each install attempt.
+Uploads have configurable size and time limits, are streamed directly to a private temporary directory, and are removed after each install attempt or client disconnect. At most two upload/install operations may hold temporary snap files; further attempts receive `429`. If a reverse proxy fronts Telesnap, configure its request-body size and timeout to allow the same limits.
 
 The API serves plain HTTP and provides no rate limiting. Keep the bearer token secret, bind to a trusted interface, and place a TLS-terminating reverse proxy in front of Telesnap before any network exposure. The health endpoint does not require authentication; it returns `503` with `{"status":"unavailable"}` whenever the cached snapd readiness probe fails.
 
