@@ -1,0 +1,24 @@
+[Unit]
+Description=Temporary snap test API
+Wants=network-online.target snapd.socket
+After=network-online.target snapd.socket
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/telesnap
+StateDirectory=telesnap
+StateDirectoryMode=0700
+EnvironmentFile=/etc/default/telesnap
+UMask=0077
+ExecStartPre=/usr/bin/snap wait system seed.loaded
+ExecStart=/usr/local/bin/telesnap
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+TimeoutStartSec=300s
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
